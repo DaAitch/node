@@ -1083,3 +1083,223 @@ napi_ref_threadsafe_function(napi_env env, napi_threadsafe_function func) {
   CHECK(func != nullptr);
   return reinterpret_cast<v8impl::ThreadSafeFunction*>(func)->Ref();
 }
+
+namespace {
+class NapiThreadsafeCallback {
+public:
+  using CallbackType = std::function<void(napi_env env, void* data)>;
+
+  struct UVCleanupDeleter {
+    void operator()(NapiThreadsafeCallback* threadsafe_callback) const {
+      threadsafe_callback->DisposeAfterUVCleanup();
+    }
+  };
+
+  struct Deleter {
+    void operator()(NapiThreadsafeCallback* threadsafe_callback) const {
+      threadsafe_callback->Dispose();
+    }
+  };
+
+  using unique_ptr_scoped = std::unique_ptr<NapiThreadsafeCallback, NapiThreadsafeCallback::UVCleanupDeleter>;
+  using unique_ptr_unscoped = std::unique_ptr<NapiThreadsafeCallback, NapiThreadsafeCallback::Deleter>;
+
+  template <typename ...Args>
+  static unique_ptr_scoped make_unique(Args&&... args) {
+    return unique_ptr_scoped(new NapiThreadsafeCallback(std::forward<Args>(args)...));
+  }
+
+  static NapiThreadsafeCallback* Unwrap(uv_async_t* async) {
+    uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(async);
+    return static_cast<NapiThreadsafeCallback*>(uv_handle_get_data(handle));
+  }
+
+  static NapiThreadsafeCallback* Unwrap(uv_idle_t* idle) {
+    uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(idle);
+    return static_cast<NapiThreadsafeCallback*>(uv_handle_get_data(handle));
+  }
+
+  static void IdleCb(uv_idle_t* idle);
+  static void AsyncCb(uv_async_t* async);
+
+public:
+  explicit NapiThreadsafeCallback(napi_env env, napi_async_context async_context);
+  virtual ~NapiThreadsafeCallback();
+  DISALLOW_COPY_AND_ASSIGN(NapiThreadsafeCallback);
+  
+public:
+  bool EnqueueCallback(void* callback_data, CallbackType callback);
+  void MakeCallback();
+  
+  bool IsInitialized() const {
+    return initialized_;
+  }
+
+private:
+  void Dispose();
+  void DisposeAfterUVCleanup();
+
+  node::Environment* node_env() {
+    return reinterpret_cast<node_napi_env>(env_)->node_env();
+  }
+
+  uv_handle_t* get_async_handle() {
+    return reinterpret_cast<uv_handle_t*>(&async_);
+  }
+  
+  uv_handle_t* get_idle_handle() {
+    return reinterpret_cast<uv_handle_t*>(&idle_);
+  }
+
+private:
+  napi_env env_ = nullptr;
+  napi_async_context async_context_ = nullptr;
+  uv_async_t async_;
+  uv_idle_t idle_;
+
+  bool initialized_ = false;
+  
+  void* callback_data_ = nullptr;
+  CallbackType callback_;
+
+  bool disposed_ = false;
+};
+
+void NapiThreadsafeCallback::IdleCb(uv_idle_t* idle) {
+  auto&& obj = unique_ptr_scoped(Unwrap(idle));
+
+  int status_uv;
+  status_uv = uv_idle_stop(&obj->idle_);
+  if (status_uv != 0) {
+    napi_throw_error(obj->env_, "ERR_NAPI_TSCB_STOP_IDLE_LOOP",
+                                "Failed to start the idle loop");
+    return;
+  }
+
+  {
+    v8::HandleScope handle_scope(obj->env_->isolate);
+    // node::CallbackScope callback_scope(obj->env_->context()->GetIsolate(), obj->env_->context()->Global(),
+    //                                     *reinterpret_cast<node::async_context*>(obj->async_context_));
+    obj->MakeCallback();
+
+    // Note: obj has to be disposed inside of scope
+    obj.reset(nullptr);
+  }
+}
+
+void NapiThreadsafeCallback::AsyncCb(uv_async_t* async) {
+  auto&& obj = unique_ptr_scoped(Unwrap(async));
+
+  int status;
+  status = uv_idle_start(&obj->idle_, IdleCb);
+  if (status != 0) {
+    napi_throw_error(obj->env_, "ERR_NAPI_TSCB_START_IDLE_LOOP",
+                                "Failed to start the idle loop");
+    return;
+  }
+
+  obj.release();
+}
+
+NapiThreadsafeCallback::NapiThreadsafeCallback(napi_env env, napi_async_context async_context) :
+                                               env_(env), async_context_(async_context) {
+  int status;
+
+  status = uv_async_init(node_env()->event_loop(), &async_, AsyncCb);
+  if (status != 0) {
+    initialized_ = false;
+    napi_fatal_error("NapiThreadsafeCallback", NAPI_AUTO_LENGTH,
+                    "uv_async_init failed", NAPI_AUTO_LENGTH);
+    return;
+  }
+  uv_handle_set_data(get_async_handle(), this);
+
+  status = uv_idle_init(node_env()->event_loop(), &idle_);
+  if (status != 0) {
+    initialized_ = false;
+    napi_fatal_error("NapiThreadsafeCallback", NAPI_AUTO_LENGTH,
+                    "uv_idle_init failed", NAPI_AUTO_LENGTH);
+    return;
+  }
+  uv_handle_set_data(get_idle_handle(), this);
+  uv_ref(get_idle_handle());
+
+  env_->Ref();
+  initialized_ = true;
+}
+
+NapiThreadsafeCallback::~NapiThreadsafeCallback() {
+  CHECK(disposed_);
+}
+
+void NapiThreadsafeCallback::Dispose() {
+  CHECK(!disposed_);
+  disposed_ = true;
+  delete this;
+}
+
+void NapiThreadsafeCallback::DisposeAfterUVCleanup() {
+  v8::HandleScope scope(env_->isolate);
+  uv_unref(get_async_handle());
+  uv_unref(get_idle_handle());
+  
+  node_env()->CloseHandle(get_async_handle(), [this](uv_handle_t*) {
+    v8::HandleScope scope(env_->isolate);
+    node_env()->CloseHandle(get_idle_handle(), [this](uv_handle_t*) {
+      env_->Unref();
+      Dispose();
+    });
+  });
+}
+
+bool NapiThreadsafeCallback::EnqueueCallback(void* callback_data, CallbackType callback) {
+  CHECK(IsInitialized());
+
+  callback_data_ = callback_data;
+  callback_ = std::move(callback);
+
+  int status;
+  status = uv_async_send(&async_);
+
+  return status == 0;
+}
+
+void NapiThreadsafeCallback::MakeCallback() {
+  CHECK(IsInitialized());
+  
+  if (callback_) {
+    callback_(env_, callback_data_);
+  }
+}
+
+}
+
+napi_status
+napi_create_threadsafe_callback(napi_env env, napi_async_context async_context, napi_threadsafe_callback* result) {
+  NAPI_PREAMBLE(env);
+  CHECK_NOT_NULL(result);
+
+  auto&& obj = NapiThreadsafeCallback::make_unique(env, async_context);
+
+  if (!obj->IsInitialized()) {
+    return napi_generic_failure;
+  }
+
+  (*result) = reinterpret_cast<napi_threadsafe_callback>(obj.release());
+  return napi_ok;
+}
+
+napi_status
+napi_make_threadsafe_callback(napi_threadsafe_callback threadsafe_callback, void* data, napi_threadsafe_callback_callback callback) {
+  CHECK_NOT_NULL(threadsafe_callback);
+
+  // Note: Called from second thread. Handle must not be closed, if something going wrong here,
+  // but leak handle instead and free data without closing it
+  NapiThreadsafeCallback::unique_ptr_unscoped obj(reinterpret_cast<NapiThreadsafeCallback*>(threadsafe_callback));
+  if (!obj->EnqueueCallback(data, callback)) {
+    return napi_generic_failure;
+  }
+
+  obj.release();
+  return napi_ok;
+}

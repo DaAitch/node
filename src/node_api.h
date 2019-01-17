@@ -230,6 +230,13 @@ napi_unref_threadsafe_function(napi_env env, napi_threadsafe_function func);
 NAPI_EXTERN napi_status
 napi_ref_threadsafe_function(napi_env env, napi_threadsafe_function func);
 
+// Threadsafe callbacks
+NAPI_EXTERN napi_status
+napi_create_threadsafe_callback(napi_env env, napi_async_context async_context, napi_threadsafe_callback* result);
+
+NAPI_EXTERN napi_status
+napi_make_threadsafe_callback(napi_threadsafe_callback cb, void* data, napi_threadsafe_callback_callback callback);
+
 #endif  // NAPI_EXPERIMENTAL
 
 EXTERN_C_END

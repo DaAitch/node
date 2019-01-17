@@ -8,6 +8,7 @@ typedef struct napi_async_context__* napi_async_context;
 typedef struct napi_async_work__* napi_async_work;
 #ifdef NAPI_EXPERIMENTAL
 typedef struct napi_threadsafe_function__* napi_threadsafe_function;
+typedef struct napi_threadsafe_callback__* napi_threadsafe_callback;
 #endif  // NAPI_EXPERIMENTAL
 
 #ifdef NAPI_EXPERIMENTAL
@@ -32,6 +33,9 @@ typedef void (*napi_threadsafe_function_call_js)(napi_env env,
                                                  napi_value js_callback,
                                                  void* context,
                                                  void* data);
+
+typedef void (*napi_threadsafe_callback_callback)(napi_env env,
+                                                  void* data);
 #endif  // NAPI_EXPERIMENTAL
 
 typedef struct {
